@@ -1484,8 +1484,8 @@ private:
             }
             return;
         }
-        // Send an AB message every 10 minutes to request pipe temperature values.
-        if (!slave_ && millis_now - last_sent_recv_type_b_millis_ > 10 * 60 * 1000) {
+        // Send an AB message every 1 minutes to request pipe temperature values.
+        if (!slave_ && millis_now - last_sent_recv_type_b_millis_ > 1 * 60 * 1000) {
             if (check_can_send()) {
                 send_type_b_settings_message(/* timed = */ true);
             }
