@@ -513,7 +513,7 @@ public:
         } else {
             this->mode = climate::CLIMATE_MODE_OFF;
             this->target_temperature = 20;
-            this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
+            this->fan_mode = climate::CLIMATE_FAN_HIGH;
             this->swing_mode = climate::CLIMATE_SWING_OFF;
             this->publish_state();
         }
