@@ -158,6 +158,27 @@ The optional `boost:` block adds a Boost preset that runs the unit as hard as it
 
 The Power fan speed also shows up as a "focus" fan mode in Home Assistant on units that support it.
 
+### Dashboard card
+
+[`lovelace/lg-thermostat-card.js`](lovelace/lg-thermostat-card.js) is a dashboard card for this controller with four tabs:
+* **Control:** target temperature, presets (including Boost with its countdown), mode and fan, and the next change from a [Scheduler](https://github.com/nielsfaber/scheduler-component) schedule for the unit.
+* **Airflow:** vane positions, drawn as a top view for 4-way ceiling cassettes or a side view for wall units, plus up-down swing.
+* **Settings:** the preset setpoints and fan modes, Boost duration, setpoint offset and sleep timer.
+* **Info:** outdoor unit, defrost, preheat, coil temperatures, error code and Wi-Fi signal.
+
+The card finds the controller's other entities through the climate entity's device. To install it, copy the file to `/config/www/`, add `/local/lg-thermostat-card.js?v=0.1.1` as a JavaScript module resource (Settings > Dashboards > Resources), and add the card:
+
+```yaml
+type: custom:lg-thermostat-card
+entity: climate.lgmasterbedroom_lg_master_bedroom
+name: Master bedroom                # optional
+unit_type: cassette                 # wall (default), cassette or ducted
+humidity_entity: sensor.bedroom_humidity   # optional
+schedule_entity: switch.schedule_x  # optional, found automatically
+```
+
+Change the `?v=` number when you update the file, or browsers keep the old copy for up to a month.
+
 # Tips
 * [Issue #43](https://github.com/JanM321/esphome-lg-controller/issues/43) has some information on temperature sensors that work well for this.
 * It's possible to use a Home Assistant template sensor as room temperature sensor. I'm [using this](https://gist.github.com/JanM321/b550285713f20231386509b2c227f0b8) to work around some issues with my LG Multi F unit in heating mode.
