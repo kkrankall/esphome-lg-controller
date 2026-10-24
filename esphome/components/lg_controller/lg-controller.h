@@ -40,6 +40,51 @@ class LgNumber final : public number::Number {
     }
 };
 
+// Preset settings are not stored by the unit, so these entities save their value to flash.
+static constexpr uint32_t PRESET_PREF_SALT = 0x50524553U;
+
+class LgStoredNumber final : public number::Number {
+    ESPPreferenceObject pref_;
+
+    void control(float value) override {
+        publish_state(value);
+        pref_.save(&value);
+    }
+
+public:
+    void restore(float default_value) {
+        pref_ = global_preferences->make_preference<float>(this->get_object_id_hash() ^ PRESET_PREF_SALT);
+        float value;
+        if (!pref_.load(&value) || std::isnan(value) ||
+            value < traits.get_min_value() || value > traits.get_max_value()) {
+            value = default_value;
+        }
+        publish_state(value);
+    }
+};
+
+class LgStoredSelect final : public select::Select {
+    ESPPreferenceObject pref_;
+
+    void control(const std::string& value) override {
+        if (auto index = index_of(value)) {
+            publish_state(value);
+            uint32_t stored = *index;
+            pref_.save(&stored);
+        }
+    }
+
+public:
+    void restore(size_t default_index) {
+        pref_ = global_preferences->make_preference<uint32_t>(this->get_object_id_hash() ^ PRESET_PREF_SALT);
+        uint32_t index;
+        if (!pref_.load(&index) || !at(index).has_value()) {
+            index = default_index;
+        }
+        publish_state(*at(index));
+    }
+};
+
 // The LG protocol always uses Celsius. The HA/ESPHome climate component internally
 // converts between Fahrenheit and Celsius. Values from the Home Assistant room temperature sensor
 // are not converted automatically so can be Celsius or Fahrenheit.
@@ -200,6 +245,27 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool active_reservation_ = false;
     bool ignore_sleep_timer_callback_ = false;
 
+    // Optional thermostat presets: Home, Away and Sleep each have a cool setpoint, a heat setpoint
+    // and a fan mode. Setpoints are in the display unit (Fahrenheit or Celsius).
+    static constexpr size_t NumPresets = 3;
+    static constexpr climate::ClimatePreset Presets[NumPresets] = {
+        climate::CLIMATE_PRESET_HOME, climate::CLIMATE_PRESET_AWAY, climate::CLIMATE_PRESET_SLEEP
+    };
+    // Must match PRESET_FAN_OPTIONS in climate.py.
+    static constexpr climate::ClimateFanMode PresetFanModes[] = {
+        climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_QUIET, climate::CLIMATE_FAN_LOW,
+        climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH
+    };
+    struct PresetEntities {
+        LgStoredNumber* cool_setpoint = nullptr;
+        LgStoredNumber* heat_setpoint = nullptr;
+        LgStoredSelect* fan_mode = nullptr;
+    };
+    PresetEntities preset_entities_[NumPresets];
+    // Added to the preset setpoints, for example by an automation that lowers the setpoint when
+    // there's excess solar power. Doesn't affect manually set temperatures.
+    LgStoredNumber* setpoint_offset_ = nullptr;
+
     uint32_t NVS_STORAGE_VERSION = 2843654U; // Change version if the NVSStorage struct changes
     struct NVSStorage {
         uint8_t capabilities_message[13] = {};
@@ -331,6 +397,136 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
                 override_swing_modes.insert(climate::CLIMATE_SWING_HORIZONTAL);
             supported_traits_.set_supported_swing_modes(override_swing_modes);
         }
+
+        if (has_presets()) {
+            // "None" means the setpoint and fan were changed manually (a hold until the next preset).
+            supported_traits_.add_supported_preset(climate::CLIMATE_PRESET_NONE);
+            for (climate::ClimatePreset preset : Presets) {
+                supported_traits_.add_supported_preset(preset);
+            }
+        }
+    }
+
+    bool has_presets() const {
+        return setpoint_offset_ != nullptr;
+    }
+
+    optional<size_t> active_preset_index() const {
+        if (!has_presets() || !this->preset.has_value()) {
+            return {};
+        }
+        for (size_t i = 0; i < NumPresets; i++) {
+            if (Presets[i] == *this->preset) {
+                return i;
+            }
+        }
+        return {};
+    }
+
+    void clear_preset(const char* reason) {
+        if (active_preset_index().has_value()) {
+            ESP_LOGD(TAG, "Clearing preset: %s", reason);
+            this->preset = climate::CLIMATE_PRESET_NONE;
+        }
+    }
+
+    // Sets the target temperature and fan mode from the active preset. The target temperature
+    // depends on the operation mode: cool and dry use the cool setpoint, heat uses the heat
+    // setpoint, and auto (heat_cool) uses the midpoint. Off and fan-only only set the fan mode.
+    // Returns true if this changes what we send to the unit.
+    bool apply_active_preset() {
+        optional<size_t> index = active_preset_index();
+        if (!index.has_value()) {
+            return false;
+        }
+        const PresetEntities& entities = preset_entities_[*index];
+        float cool = entities.cool_setpoint->state;
+        float heat = entities.heat_setpoint->state;
+
+        optional<float> setpoint;
+        switch (this->mode) {
+            case climate::CLIMATE_MODE_COOL:
+            case climate::CLIMATE_MODE_DRY:
+                setpoint = cool;
+                break;
+            case climate::CLIMATE_MODE_HEAT:
+                setpoint = heat;
+                break;
+            case climate::CLIMATE_MODE_HEAT_COOL:
+                setpoint = (cool + heat) / 2;
+                break;
+            default:
+                break;
+        }
+
+        bool changed = false;
+        if (setpoint.has_value() && !std::isnan(*setpoint)) {
+            float value = *setpoint;
+            if (!std::isnan(setpoint_offset_->state)) {
+                value += setpoint_offset_->state;
+            }
+            // Round to the step size of the display unit.
+            value = fahrenheit_ ? round(value) : round(value * 2) / 2;
+            float target = fahrenheit_ ? esphome::fahrenheit_to_celsius(value) : value;
+            target = std::clamp(target, float(MIN_TEMP_SETPOINT), float(MAX_TEMP_SETPOINT));
+            changed |= target_to_lg(target) != target_to_lg(this->target_temperature);
+            this->target_temperature = target;
+        }
+
+        if (optional<size_t> fan_index = entities.fan_mode->active_index()) {
+            climate::ClimateFanMode fan_mode = PresetFanModes[*fan_index];
+            if (supported_traits_.supports_fan_mode(fan_mode)) {
+                changed |= this->fan_mode != fan_mode;
+                this->fan_mode = fan_mode;
+            } else {
+                ESP_LOGW(TAG, "Preset fan mode %s is not supported by this unit",
+                         entities.fan_mode->at(*fan_index).value_or("").c_str());
+            }
+        }
+
+        ESP_LOGD(TAG, "Applied preset %u for mode %u (changed: %d)", unsigned(*index),
+                 unsigned(this->mode), changed);
+        return changed;
+    }
+
+    // Called when a preset setting or the setpoint offset changes. `index` is the preset that
+    // changed, or empty for the offset (which applies to all presets).
+    void on_preset_setting_changed(optional<size_t> index) {
+        if (is_initializing_) {
+            return;
+        }
+        optional<size_t> active = active_preset_index();
+        if (!active.has_value() || (index.has_value() && *index != *active)) {
+            return;
+        }
+        if (apply_active_preset()) {
+            pending_status_change_ = true;
+            publish_state();
+        }
+    }
+
+    // Loads the preset settings from flash, or the defaults on first boot.
+    void restore_preset_entities() {
+        struct PresetDefaults { float cool; float heat; size_t fan_index; };
+        // Fan index into PresetFanModes: 0 = Auto, 2 = Low.
+        static constexpr PresetDefaults DefaultsFahrenheit[NumPresets] = {
+            {75, 68, 0}, {80, 62, 0}, {72, 66, 2}
+        };
+        static constexpr PresetDefaults DefaultsCelsius[NumPresets] = {
+            {24, 20, 0}, {27, 17, 0}, {22, 19, 2}
+        };
+        const PresetDefaults* defaults = fahrenheit_ ? DefaultsFahrenheit : DefaultsCelsius;
+        for (size_t i = 0; i < NumPresets; i++) {
+            const PresetEntities& entities = preset_entities_[i];
+            if (entities.cool_setpoint == nullptr) {
+                ESP_LOGE(TAG, "Missing entities for preset %u", unsigned(i));
+                continue;
+            }
+            entities.cool_setpoint->restore(defaults[i].cool);
+            entities.heat_setpoint->restore(defaults[i].heat);
+            entities.fan_mode->restore(defaults[i].fan_index);
+        }
+        setpoint_offset_->restore(0);
     }
 
 public:
@@ -436,6 +632,32 @@ public:
         });
     }
 
+    // Index 0 is Home, 1 is Away, 2 is Sleep.
+    void set_preset_entities(size_t index, LgStoredNumber* cool_setpoint,
+                             LgStoredNumber* heat_setpoint, LgStoredSelect* fan_mode) {
+        if (index >= NumPresets) {
+            ESP_LOGE(TAG, "Unexpected preset index: %u", unsigned(index));
+            return;
+        }
+        preset_entities_[index] = {cool_setpoint, heat_setpoint, fan_mode};
+        cool_setpoint->add_on_state_callback([this, index](float) {
+            on_preset_setting_changed(index);
+        });
+        heat_setpoint->add_on_state_callback([this, index](float) {
+            on_preset_setting_changed(index);
+        });
+        fan_mode->add_on_state_callback([this, index](size_t) {
+            on_preset_setting_changed(index);
+        });
+    }
+
+    void set_setpoint_offset(LgStoredNumber* setpoint_offset) {
+        setpoint_offset_ = setpoint_offset;
+        setpoint_offset_->add_on_state_callback([this](float) {
+            on_preset_setting_changed({});
+        });
+    }
+
     float get_setup_priority() const override {
         return esphome::setup_priority::BUS;
     }
@@ -460,6 +682,13 @@ public:
             this->fan_mode = climate::CLIMATE_FAN_HIGH;
             this->swing_mode = climate::CLIMATE_SWING_OFF;
             this->publish_state();
+        }
+
+        if (has_presets()) {
+            if (!this->preset.has_value()) {
+                this->preset = climate::CLIMATE_PRESET_NONE;
+            }
+            restore_preset_entities();
         }
 
         internal_thermistor_.restore_and_set_mode(esphome::switch_::SWITCH_RESTORE_DEFAULT_OFF);
@@ -489,13 +718,31 @@ public:
 
     // Process changes from HA.
     void control(const climate::ClimateCall &call) override {
+        bool mode_changed = false;
         if (call.get_mode().has_value()) {
+            mode_changed = this->mode != *call.get_mode();
             this->mode = *call.get_mode();
         }
+        // Selecting a preset (or changing the mode while one is active) sets the preset's
+        // setpoint and fan mode. A temperature or fan mode set in the same call takes precedence.
+        bool preset_selected = call.get_preset().has_value();
+        if (preset_selected) {
+            this->preset = *call.get_preset();
+        }
+        if (preset_selected || mode_changed) {
+            apply_active_preset();
+        }
         if (call.get_target_temperature().has_value()) {
-            this->target_temperature = *call.get_target_temperature();
+            float target = *call.get_target_temperature();
+            if (!preset_selected && target_to_lg(target) != target_to_lg(this->target_temperature)) {
+                clear_preset("temperature changed in Home Assistant");
+            }
+            this->target_temperature = target;
         }
         if (call.get_fan_mode().has_value()) {
+            if (!preset_selected && this->fan_mode != *call.get_fan_mode()) {
+                clear_preset("fan mode changed in Home Assistant");
+            }
             this->fan_mode = *call.get_fan_mode();
         }
         if (call.get_swing_mode().has_value()) {
@@ -590,6 +837,22 @@ private:
         if (!is_initializing_) {
             pending_status_change_ = true;
         }
+    }
+
+    // Converts a target temperature (Celsius) to the value we send to the unit: LG-Celsius in
+    // Fahrenheit mode, clamped to the supported range, with the fractional part dropped unless
+    // it's .5 (the protocol only has a half-degree flag).
+    float target_to_lg(float target) const {
+        if (fahrenheit_) {
+            target = TempConversion::celsius_to_lgcelsius(target);
+        }
+        if (target < MIN_TEMP_SETPOINT) {
+            target = MIN_TEMP_SETPOINT;
+        } else if (target > MAX_TEMP_SETPOINT) {
+            target = MAX_TEMP_SETPOINT;
+        }
+        float whole = uint8_t(target);
+        return target - whole == 0.5 ? whole + 0.5f : whole;
     }
 
     optional<float> get_room_temp() const {
@@ -743,15 +1006,7 @@ private:
         // Byte 4.
         send_buf_[4] = last_recv_status_[4];
 
-        float target = this->target_temperature;
-        if (fahrenheit_) {
-            target = TempConversion::celsius_to_lgcelsius(target);
-        }
-        if (target < MIN_TEMP_SETPOINT) {
-            target = MIN_TEMP_SETPOINT;
-        } else if (target > MAX_TEMP_SETPOINT) {
-            target = MAX_TEMP_SETPOINT;
-        }
+        float target = target_to_lg(this->target_temperature);
 
         // Byte 5. Unchanged except for the low bit which indicates the target temperature has a
         // 0.5 fractional part.
@@ -974,6 +1229,8 @@ private:
             return;
         }
 
+        bool was_initializing = is_initializing_;
+
         // Consider slave controller initialized if we received a status message from the other
         // controller or the unit.
         if (slave_) {
@@ -1046,6 +1303,11 @@ private:
             memcpy(last_recv_status_, buffer, MsgLen);
         }
 
+        // Used to detect changes made on the unit or another controller while a preset is active.
+        climate::ClimateMode prev_mode = this->mode;
+        optional<climate::ClimateFanMode> prev_fan_mode = this->fan_mode;
+        float prev_lg_target = target_to_lg(this->target_temperature);
+
         uint8_t b = buffer[1];
         if ((b & 0x2) == 0) {
             this->mode = climate::CLIMATE_MODE_OFF;
@@ -1117,10 +1379,22 @@ private:
         if (buffer[5] & 0x1) {
             target += 0.5;
         }
+        float lg_target = target;
         if (fahrenheit_) {
             target = TempConversion::lgcelsius_to_celsius(target);
         }
         this->target_temperature = target;
+
+        // A setpoint or fan change from the wall controller, remote or ThinQ app is a manual
+        // hold, like a change from HA. A mode change keeps the preset and switches to its
+        // setpoint for the new mode.
+        if (!was_initializing && active_preset_index().has_value()) {
+            if (lg_target != prev_lg_target || this->fan_mode != prev_fan_mode) {
+                clear_preset("setpoint or fan mode changed on the unit");
+            } else if (this->mode != prev_mode && apply_active_preset()) {
+                pending_status_change_ = true;
+            }
+        }
 
         active_reservation_ = buffer[3] & 0x10;
 

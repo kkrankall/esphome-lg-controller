@@ -148,3 +148,48 @@ climate:
       name: Auto Dry
       id: auto_dry
       icon: mdi:fan-clock
+    # Thermostat presets (Home, Away, Sleep). Remove this block to disable presets.
+    presets:
+      home:
+        cool_setpoint:
+          name: Home Cool Setpoint
+          icon: mdi:snowflake-thermometer
+          entity_category: config
+        heat_setpoint:
+          name: Home Heat Setpoint
+          icon: mdi:sun-thermometer
+          entity_category: config
+        fan_mode:
+          name: Home Fan Mode
+          icon: mdi:fan
+          entity_category: config
+      away:
+        cool_setpoint:
+          name: Away Cool Setpoint
+          icon: mdi:snowflake-thermometer
+          entity_category: config
+        heat_setpoint:
+          name: Away Heat Setpoint
+          icon: mdi:sun-thermometer
+          entity_category: config
+        fan_mode:
+          name: Away Fan Mode
+          icon: mdi:fan
+          entity_category: config
+      sleep:
+        cool_setpoint:
+          name: Sleep Cool Setpoint
+          icon: mdi:snowflake-thermometer
+          entity_category: config
+        heat_setpoint:
+          name: Sleep Heat Setpoint
+          icon: mdi:sun-thermometer
+          entity_category: config
+        fan_mode:
+          name: Sleep Fan Mode
+          icon: mdi:fan
+          entity_category: config
+      setpoint_offset:
+        name: Setpoint Offset
+        icon: mdi:thermometer-plus
+        mode: box

@@ -2,7 +2,13 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import pins
 from esphome.components import binary_sensor, climate, number, select, sensor, switch, uart
-from esphome.const import CONF_ID, CONF_RX_PIN, CONF_INTERNAL
+from esphome.const import (
+    CONF_ID,
+    CONF_RX_PIN,
+    CONF_INTERNAL,
+    CONF_UNIT_OF_MEASUREMENT,
+    DEVICE_CLASS_TEMPERATURE,
+)
 
 CODEOWNERS = ["JanM321"]
 DEPENDENCIES = ["uart"]
@@ -15,6 +21,8 @@ LgController = lg_controller_ns.class_(
 LgNumber = lg_controller_ns.class_("LgNumber", number.Number, cg.Component)
 LgSelect = lg_controller_ns.class_("LgSelect", select.Select, cg.Component)
 LgSwitch = lg_controller_ns.class_("LgSwitch", switch.Switch, cg.Component)
+LgStoredNumber = lg_controller_ns.class_("LgStoredNumber", number.Number)
+LgStoredSelect = lg_controller_ns.class_("LgStoredSelect", select.Select)
 
 CONF_FAHRENHEIT = "fahrenheit"
 CONF_IS_SLAVE_CONTROLLER = "is_slave_controller"
@@ -47,8 +55,39 @@ CONF_PURIFIER = "purifier"
 CONF_INTERNAL_THERMISTOR = "internal_thermistor"
 CONF_AUTO_DRY = "auto_dry"
 
+CONF_PRESETS = "presets"
+CONF_HOME = "home"
+CONF_AWAY = "away"
+CONF_SLEEP = "sleep"
+CONF_COOL_SETPOINT = "cool_setpoint"
+CONF_HEAT_SETPOINT = "heat_setpoint"
+CONF_PRESET_FAN_MODE = "fan_mode"
+CONF_SETPOINT_OFFSET = "setpoint_offset"
+
+# Order matches the preset index in LgController::set_preset_entities.
+PRESET_KEYS = [CONF_HOME, CONF_AWAY, CONF_SLEEP]
+# Must match PresetFanModes in lg-controller.h.
+PRESET_FAN_OPTIONS = ["Auto", "Quiet", "Low", "Medium", "High"]
+
 VANE_OPTIONS = ["0 (Default)", "1 (Up)", "2", "3", "4", "5", "6 (Down)"]
 OVERHEATING_OPTIONS = ["0 (Default)", "1 (+4C/+6C)", "2 (+2C/+4C)", "3 (-1C/+1C)", "4 (-0.5C/+0.5C)"]
+
+PRESET_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_COOL_SETPOINT): number.number_schema(LgStoredNumber, device_class=DEVICE_CLASS_TEMPERATURE),
+        cv.Required(CONF_HEAT_SETPOINT): number.number_schema(LgStoredNumber, device_class=DEVICE_CLASS_TEMPERATURE),
+        cv.Required(CONF_PRESET_FAN_MODE): select.select_schema(LgStoredSelect),
+    }
+)
+
+PRESETS_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_HOME): PRESET_SCHEMA,
+        cv.Required(CONF_AWAY): PRESET_SCHEMA,
+        cv.Required(CONF_SLEEP): PRESET_SCHEMA,
+        cv.Required(CONF_SETPOINT_OFFSET): number.number_schema(LgStoredNumber),
+    }
+)
 
 CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
     {
@@ -84,8 +123,33 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
         cv.Required(CONF_PURIFIER): switch.switch_schema(LgSwitch),
         cv.Required(CONF_INTERNAL_THERMISTOR): switch.switch_schema(LgSwitch),
         cv.Required(CONF_AUTO_DRY): switch.switch_schema(LgSwitch),
+
+        cv.Optional(CONF_PRESETS): PRESETS_SCHEMA,
     }
 ).extend(cv.COMPONENT_SCHEMA).extend(uart.UART_DEVICE_SCHEMA)
+
+async def new_temperature_number(config, fahrenheit, *, min_value, max_value, step):
+    config.setdefault(CONF_UNIT_OF_MEASUREMENT, "°F" if fahrenheit else "°C")
+    return await number.new_number(config, min_value=min_value, max_value=max_value, step=step)
+
+async def setup_presets(var, config, fahrenheit):
+    # Setpoint limits match MIN_TEMP_SETPOINT/MAX_TEMP_SETPOINT (16-30 C).
+    if fahrenheit:
+        setpoint_range = dict(min_value=61, max_value=86, step=1)
+        offset_range = dict(min_value=-10, max_value=10, step=1)
+    else:
+        setpoint_range = dict(min_value=16, max_value=30, step=0.5)
+        offset_range = dict(min_value=-5, max_value=5, step=0.5)
+
+    for index, key in enumerate(PRESET_KEYS):
+        preset = config[key]
+        cool = await new_temperature_number(preset[CONF_COOL_SETPOINT], fahrenheit, **setpoint_range)
+        heat = await new_temperature_number(preset[CONF_HEAT_SETPOINT], fahrenheit, **setpoint_range)
+        fan = await select.new_select(preset[CONF_PRESET_FAN_MODE], options=PRESET_FAN_OPTIONS)
+        cg.add(var.set_preset_entities(index, cool, heat, fan))
+
+    offset = await new_temperature_number(config[CONF_SETPOINT_OFFSET], fahrenheit, **offset_range)
+    cg.add(var.set_setpoint_offset(offset))
 
 async def to_code(config):
     rx_pin = await cg.gpio_pin_expression(config[CONF_RX_PIN])
@@ -138,6 +202,8 @@ async def to_code(config):
                            defrost, preheat, outdoor, auto_dry_active,
                            purifier, internal_thermistor, auto_dry,
                            config[CONF_FAHRENHEIT], config[CONF_IS_SLAVE_CONTROLLER])
+    if CONF_PRESETS in config:
+        await setup_presets(var, config[CONF_PRESETS], config[CONF_FAHRENHEIT])
     await climate.register_climate(var, config)
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)

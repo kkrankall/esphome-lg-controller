@@ -121,10 +121,31 @@ Features currently available in Home Assistant:
 * Select option for over heating installer setting from 0-4 (to change over heating behavior in heating mode). This is installer setting 15 (Over Heating) on LG controllers.
 * YAML options for Fahrenheit mode and 'slave' controller mode.
 * Detects & exposes only supported operation/fan/swing modes for the connected indoor unit.
+* Optional thermostat presets (Home, Away, Sleep) with their own cool setpoint, heat setpoint and fan mode, plus a setpoint offset. See [Thermostat presets](#thermostat-presets).
 
 The LG ThinQ app and wireless remote can still be used to change these settings and other settings. They'll be synchronized with this controller.
 
 Unfortunately not all settings are exposed to the wired controller, but if you're interested in a feature and it's supported by the PREMTB100 or PREMTA200 controller, please open an issue and we can consider adding it.
+
+## Thermostat presets
+
+The `presets:` block in [`base.yaml`](esphome/base.yaml) adds Home, Away and Sleep presets to the climate entity, so Home Assistant shows a preset selector like a regular thermostat. Remove the block if you don't want presets.
+
+Each preset has a cool setpoint, a heat setpoint and a fan mode. These are entities in Home Assistant (under Configuration on the device page) and are saved on the controller, so they survive reboots and work without changing your automations. The setpoints use Fahrenheit or Celsius depending on the `fahrenheit` option.
+
+When a preset is selected, the controller sets the target temperature for the current operation mode:
+* Cool and dry use the cool setpoint, heat uses the heat setpoint, and auto (heat/cool) uses the midpoint of the two.
+* Off and fan only keep the target temperature and only set the fan mode.
+* Changing the operation mode keeps the preset and switches to its setpoint for the new mode, so the same schedule works for summer and winter.
+* Changing a preset's setpoint or fan mode while it's active applies it right away.
+
+Changing the temperature or fan mode yourself (in Home Assistant, on the wall controller, with the remote or in ThinQ) switches the preset to "none". This works like a temporary hold: the next preset you select (for example from a schedule) takes over again.
+
+The **Setpoint Offset** is added to the preset setpoints, for example -2 to cool a bit more when there's excess solar power. It only applies while a preset is active.
+
+To schedule presets, call `climate.set_preset_mode` with `home`, `away` or `sleep` from an automation or a scheduler (for example the [Scheduler card](https://github.com/nielsfaber/scheduler-card)). Avoid calling `climate.set_temperature` from schedules, because that counts as a manual change and clears the preset.
+
+Defaults on first boot: Home 75°F/68°F (24°C/20°C) with auto fan, Away 80°F/62°F (27°C/17°C) with auto fan, Sleep 72°F/66°F (22°C/19°C) with low fan.
 
 # Tips
 * [Issue #43](https://github.com/JanM321/esphome-lg-controller/issues/43) has some information on temperature sensors that work well for this.
