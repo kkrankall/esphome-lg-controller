@@ -266,6 +266,28 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     // there's excess solar power. Doesn't affect manually set temperatures.
     LgStoredNumber* setpoint_offset_ = nullptr;
 
+    // Optional Boost preset: runs the Jet/Power fan (or High if the unit doesn't have it) with
+    // the setpoint at the end of the range for a set time, then goes back to what was active
+    // before.
+    static constexpr float BOOST_COOL_TARGET = 18; // What LG's Jet Cool sets.
+    static constexpr float BOOST_HEAT_TARGET = MAX_TEMP_SETPOINT;
+    static constexpr uint32_t BOOST_PREF_VERSION = 0x424F4F53U;
+    LgStoredNumber* boost_duration_ = nullptr;
+    sensor::Sensor* boost_remaining_ = nullptr;
+    optional<uint32_t> boost_end_millis_{};
+    // What to go back to when Boost ends. Saved to flash so a reboot during Boost restores it.
+    struct BoostRestoreState {
+        climate::ClimatePreset preset;
+        float target_temperature;
+        climate::ClimateFanMode fan_mode;
+    };
+    BoostRestoreState boost_restore_{climate::CLIMATE_PRESET_NONE, 20, climate::CLIMATE_FAN_AUTO};
+    ESPPreferenceObject boost_restore_pref_;
+    // How Boost ends: Keep leaves the settings (another preset replaces them), RestoreSettings
+    // goes back to the setpoint and fan mode from before Boost (with preset "none"), and
+    // RestorePreset also goes back to the preset that was active.
+    enum class BoostEnd : uint8_t { Keep, RestoreSettings, RestorePreset };
+
     uint32_t NVS_STORAGE_VERSION = 2843654U; // Change version if the NVSStorage struct changes
     struct NVSStorage {
         uint8_t capabilities_message[13] = {};
@@ -410,11 +432,22 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
             for (climate::ClimatePreset preset : Presets) {
                 supported_traits_.add_supported_preset(preset);
             }
+            if (has_boost()) {
+                supported_traits_.add_supported_preset(climate::CLIMATE_PRESET_BOOST);
+            }
         }
     }
 
     bool has_presets() const {
         return setpoint_offset_ != nullptr;
+    }
+
+    bool has_boost() const {
+        return has_presets() && boost_duration_ != nullptr;
+    }
+
+    bool boost_active() const {
+        return has_boost() && this->preset == climate::CLIMATE_PRESET_BOOST;
     }
 
     optional<size_t> active_preset_index() const {
@@ -441,6 +474,9 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     // setpoint, and auto (heat_cool) uses the midpoint. Off and fan-only only set the fan mode.
     // Returns true if this changes what we send to the unit.
     bool apply_active_preset() {
+        if (boost_active()) {
+            return apply_boost();
+        }
         optional<size_t> index = active_preset_index();
         if (!index.has_value()) {
             return false;
@@ -495,6 +531,85 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         return changed;
     }
 
+    // Boost sets the Jet/Power fan (High if unsupported) and, in cool, dry and heat, the setpoint
+    // at the end of the range. It doesn't change the operation mode.
+    bool apply_boost() {
+        optional<float> target;
+        switch (this->mode) {
+            case climate::CLIMATE_MODE_COOL:
+            case climate::CLIMATE_MODE_DRY:
+                target = BOOST_COOL_TARGET;
+                break;
+            case climate::CLIMATE_MODE_HEAT:
+                target = BOOST_HEAT_TARGET;
+                break;
+            default:
+                break;
+        }
+        bool changed = false;
+        if (target.has_value()) {
+            changed |= target_to_lg(*target) != target_to_lg(this->target_temperature);
+            this->target_temperature = *target;
+        }
+        climate::ClimateFanMode fan_mode = supported_traits_.supports_fan_mode(climate::CLIMATE_FAN_FOCUS)
+            ? climate::CLIMATE_FAN_FOCUS : climate::CLIMATE_FAN_HIGH;
+        changed |= this->fan_mode != fan_mode;
+        this->fan_mode = fan_mode;
+        return changed;
+    }
+
+    // Starts (or restarts) the Boost timer. `previous_preset` is the preset before Boost was
+    // selected; selecting Boost again keeps the state saved the first time.
+    void start_boost(climate::ClimatePreset previous_preset) {
+        if (previous_preset != climate::CLIMATE_PRESET_BOOST) {
+            boost_restore_ = {previous_preset, this->target_temperature,
+                              this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO)};
+            boost_restore_pref_.save(&boost_restore_);
+        }
+        float minutes = boost_duration_->state;
+        if (std::isnan(minutes) || minutes < 1) {
+            minutes = 30;
+        }
+        boost_end_millis_ = millis() + uint32_t(minutes) * 60 * 1000;
+        ESP_LOGD(TAG, "Boost started for %u minutes", unsigned(minutes));
+        publish_boost_remaining();
+    }
+
+    void end_boost(BoostEnd how) {
+        ESP_LOGD(TAG, "Boost ended (%u)", unsigned(how));
+        boost_end_millis_.reset();
+        publish_boost_remaining();
+        if (how == BoostEnd::Keep) {
+            return;
+        }
+        if (how == BoostEnd::RestorePreset) {
+            this->preset = boost_restore_.preset;
+            if (active_preset_index().has_value()) {
+                apply_active_preset();
+                return;
+            }
+        }
+        this->preset = climate::CLIMATE_PRESET_NONE;
+        this->target_temperature = boost_restore_.target_temperature;
+        if (supported_traits_.supports_fan_mode(boost_restore_.fan_mode)) {
+            this->fan_mode = boost_restore_.fan_mode;
+        }
+    }
+
+    void publish_boost_remaining() {
+        if (boost_remaining_ == nullptr) {
+            return;
+        }
+        float minutes = 0;
+        if (boost_end_millis_.has_value()) {
+            int32_t diff = int32_t(*boost_end_millis_ - millis());
+            minutes = diff > 0 ? (uint32_t(diff) + 59999) / 60000 : 0;
+        }
+        if (boost_remaining_->state != minutes) {
+            boost_remaining_->publish_state(minutes);
+        }
+    }
+
     // Called when a preset setting or the setpoint offset changes. `index` is the preset that
     // changed, or empty for the offset (which applies to all presets).
     void on_preset_setting_changed(optional<size_t> index) {
@@ -533,6 +648,9 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
             entities.fan_mode->restore(defaults[i].fan_index);
         }
         setpoint_offset_->restore(0);
+        if (boost_duration_ != nullptr) {
+            boost_duration_->restore(30);
+        }
     }
 
 public:
@@ -664,6 +782,11 @@ public:
         });
     }
 
+    void set_boost_entities(LgStoredNumber* duration, sensor::Sensor* remaining) {
+        boost_duration_ = duration;
+        boost_remaining_ = remaining;
+    }
+
     float get_setup_priority() const override {
         return esphome::setup_priority::BUS;
     }
@@ -695,6 +818,22 @@ public:
                 this->preset = climate::CLIMATE_PRESET_NONE;
             }
             restore_preset_entities();
+        }
+
+        if (has_boost()) {
+            boost_restore_pref_ = global_preferences->make_preference<BoostRestoreState>(
+                this->get_object_id_hash() ^ BOOST_PREF_VERSION);
+            bool loaded = boost_restore_pref_.load(&boost_restore_);
+            // The Boost timer doesn't survive a reboot, so go back to what was active before it.
+            if (boost_active()) {
+                if (loaded) {
+                    end_boost(BoostEnd::RestorePreset);
+                } else {
+                    this->preset = climate::CLIMATE_PRESET_NONE;
+                }
+                pending_status_change_ = true;
+            }
+            publish_boost_remaining();
         }
 
         internal_thermistor_.restore_and_set_mode(esphome::switch_::SWITCH_RESTORE_DEFAULT_OFF);
@@ -729,11 +868,30 @@ public:
             mode_changed = this->mode != *call.get_mode();
             this->mode = *call.get_mode();
         }
+        bool preset_selected = call.get_preset().has_value();
+        if (boost_active()) {
+            bool target_changed = call.get_target_temperature().has_value() &&
+                target_to_lg(*call.get_target_temperature()) != target_to_lg(this->target_temperature);
+            bool fan_changed = call.get_fan_mode().has_value() && this->fan_mode != *call.get_fan_mode();
+            if (preset_selected && *call.get_preset() != climate::CLIMATE_PRESET_BOOST) {
+                // Another preset replaces Boost. "None" cancels Boost and goes back to the
+                // setpoint and fan mode from before it.
+                end_boost(*call.get_preset() == climate::CLIMATE_PRESET_NONE ? BoostEnd::RestoreSettings
+                                                                              : BoostEnd::Keep);
+            } else if (!preset_selected && (target_changed || fan_changed)) {
+                // A manual change cancels Boost and is applied on top of the settings from
+                // before Boost.
+                end_boost(BoostEnd::RestoreSettings);
+            }
+        }
         // Selecting a preset (or changing the mode while one is active) sets the preset's
         // setpoint and fan mode. A temperature or fan mode set in the same call takes precedence.
-        bool preset_selected = call.get_preset().has_value();
         if (preset_selected) {
+            climate::ClimatePreset previous = this->preset.value_or(climate::CLIMATE_PRESET_NONE);
             this->preset = *call.get_preset();
+            if (*call.get_preset() == climate::CLIMATE_PRESET_BOOST) {
+                start_boost(previous);
+            }
         }
         if (preset_selected || mode_changed) {
             apply_active_preset();
@@ -1399,8 +1557,13 @@ private:
 
         // A setpoint or fan change from the wall controller, remote or ThinQ app is a manual
         // hold, like a change from HA. A mode change keeps the preset and switches to its
-        // setpoint for the new mode.
-        if (!was_initializing && active_preset_index().has_value()) {
+        // setpoint for the new mode. Boost ignores setpoint and fan changes from the unit (it
+        // may not accept the Jet fan in every mode) and ends on its timer.
+        if (!was_initializing && boost_active()) {
+            if (this->mode != prev_mode && apply_active_preset()) {
+                pending_status_change_ = true;
+            }
+        } else if (!was_initializing && active_preset_index().has_value()) {
             if (lg_target != prev_lg_target || this->fan_mode != prev_fan_mode) {
                 clear_preset("setpoint or fan mode changed on the unit");
             } else if (this->mode != prev_mode && apply_active_preset()) {
@@ -1640,6 +1803,17 @@ private:
         }
 
         uint32_t millis_now = millis();
+
+        // Handle Boost timer.
+        if (boost_end_millis_.has_value()) {
+            if (int32_t(boost_end_millis_.value() - millis_now) <= 0) {
+                end_boost(BoostEnd::RestorePreset);
+                pending_status_change_ = true;
+                publish_state();
+            } else {
+                publish_boost_remaining();
+            }
+        }
 
         // Handle sleep timer.
         if (sleep_timer_target_millis_.has_value()) {

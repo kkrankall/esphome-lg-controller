@@ -193,3 +193,13 @@ climate:
         name: Setpoint Offset
         icon: mdi:thermometer-plus
         mode: box
+      # Optional Boost preset. Remove this block to disable Boost.
+      boost:
+        duration:
+          name: Boost Duration
+          icon: mdi:timer-cog-outline
+          entity_category: config
+          mode: box
+        remaining:
+          name: Boost Remaining
+          icon: mdi:rocket-launch-outline

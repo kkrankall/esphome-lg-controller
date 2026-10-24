@@ -147,6 +147,17 @@ To schedule presets, call `climate.set_preset_mode` with `home`, `away` or `slee
 
 Defaults on first boot: Home 75°F/68°F (24°C/20°C) with auto fan, Away 80°F/62°F (27°C/17°C) with auto fan, Sleep 72°F/66°F (22°C/19°C) with low fan.
 
+### Boost
+
+The optional `boost:` block adds a Boost preset that runs the unit as hard as it can for a while, then goes back to what was active before:
+* The fan runs at Power (LG's Jet Cool/Jet mode) if the unit supports it, or at High if it doesn't.
+* In cool and dry the setpoint goes to 64°F (18°C), the same as LG's Jet Cool. In heat it goes to 86°F (30°C). Boost doesn't change the operation mode.
+* After **Boost Duration** minutes (default 30) it goes back to the preset that was active before, or to the setpoint and fan mode from before if no preset was active. **Boost Remaining** shows the minutes left.
+* Selecting another preset ends Boost early. Selecting "none" or changing the temperature or fan mode yourself ends Boost and goes back to the setpoint and fan mode from before (as a hold).
+* Changes on the unit during Boost don't cancel it. If the controller restarts during Boost, it goes back to what was active before.
+
+The Power fan speed also shows up as a "focus" fan mode in Home Assistant on units that support it.
+
 # Tips
 * [Issue #43](https://github.com/JanM321/esphome-lg-controller/issues/43) has some information on temperature sensors that work well for this.
 * It's possible to use a Home Assistant template sensor as room temperature sensor. I'm [using this](https://gist.github.com/JanM321/b550285713f20231386509b2c227f0b8) to work around some issues with my LG Multi F unit in heating mode.

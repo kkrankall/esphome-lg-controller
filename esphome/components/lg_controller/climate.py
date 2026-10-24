@@ -8,6 +8,7 @@ from esphome.const import (
     CONF_INTERNAL,
     CONF_UNIT_OF_MEASUREMENT,
     DEVICE_CLASS_TEMPERATURE,
+    UNIT_MINUTE,
 )
 
 CODEOWNERS = ["JanM321"]
@@ -63,6 +64,9 @@ CONF_COOL_SETPOINT = "cool_setpoint"
 CONF_HEAT_SETPOINT = "heat_setpoint"
 CONF_PRESET_FAN_MODE = "fan_mode"
 CONF_SETPOINT_OFFSET = "setpoint_offset"
+CONF_BOOST = "boost"
+CONF_BOOST_DURATION = "duration"
+CONF_BOOST_REMAINING = "remaining"
 
 # Order matches the preset index in LgController::set_preset_entities.
 PRESET_KEYS = [CONF_HOME, CONF_AWAY, CONF_SLEEP]
@@ -86,6 +90,12 @@ PRESETS_SCHEMA = cv.Schema(
         cv.Required(CONF_AWAY): PRESET_SCHEMA,
         cv.Required(CONF_SLEEP): PRESET_SCHEMA,
         cv.Required(CONF_SETPOINT_OFFSET): number.number_schema(LgStoredNumber),
+        cv.Optional(CONF_BOOST): cv.Schema(
+            {
+                cv.Required(CONF_BOOST_DURATION): number.number_schema(LgStoredNumber, unit_of_measurement=UNIT_MINUTE),
+                cv.Required(CONF_BOOST_REMAINING): sensor.sensor_schema(unit_of_measurement=UNIT_MINUTE, accuracy_decimals=0),
+            }
+        ),
     }
 )
 
@@ -150,6 +160,12 @@ async def setup_presets(var, config, fahrenheit):
 
     offset = await new_temperature_number(config[CONF_SETPOINT_OFFSET], fahrenheit, **offset_range)
     cg.add(var.set_setpoint_offset(offset))
+
+    if CONF_BOOST in config:
+        boost = config[CONF_BOOST]
+        duration = await number.new_number(boost[CONF_BOOST_DURATION], min_value=1, max_value=180, step=1)
+        remaining = await sensor.new_sensor(boost[CONF_BOOST_REMAINING])
+        cg.add(var.set_boost_entities(duration, remaining))
 
 async def to_code(config):
     rx_pin = await cg.gpio_pin_expression(config[CONF_RX_PIN])
