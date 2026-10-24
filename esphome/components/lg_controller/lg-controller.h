@@ -1438,11 +1438,11 @@ private:
 
             ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
             memcpy(nvs_storage_.capabilities_message, buffer, MsgLen);
+            pref.save(&nvs_storage_);
 
             // If no capabilities were stored in NVS before, restart to make sure we get the correct traits for climate
             // No restart just on changes (which is unlikely anyway) to make sure we don't end up in a bootloop for faulty devices / communication
             if (needsRestart) {
-                pref.save(&nvs_storage_);
                 global_preferences->sync();
                 ESP_LOGD(TAG, "restarting to apply initial capabilities");
                 App.safe_reboot();
